@@ -11,7 +11,9 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /** One recognized line with its centre in screen pixels (tappable as `t<n>`). */
-data class OcrLine(val text: String, val x: Int, val y: Int)
+data class OcrLine(val text: String, val x: Int, val y: Int,
+    val left: Int = x - 24, val top: Int = y - 12, val right: Int = x + 24, val bottom: Int = y + 12)
+data class RecognizedText(val lines: List<OcrLine>, val targets: List<VisualStamp>)
 
 /**
  * On-device text recognition (ML Kit, bundled Chinese model, which also reads Latin script) for
@@ -21,18 +23,29 @@ data class OcrLine(val text: String, val x: Int, val y: Int)
 class ScreenOcr @Inject constructor() {
     private val recognizer by lazy { TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build()) }
 
-    /** Lines top to bottom, then left to right. [bitmap] is in screen pixels. */
-    suspend fun read(bitmap: Bitmap): List<OcrLine> {
-        val image = InputImage.fromBitmap(bitmap, 0)
-        val result = suspendCancellableCoroutine { cont ->
-            recognizer.process(image)
-                .addOnSuccessListener { if (cont.isActive) cont.resume(it) }
-                .addOnFailureListener { if (cont.isActive) cont.resumeWithException(it) }
+    /** Takes ownership of [bitmap]; release it when ML Kit finishes, even if the caller was cancelled. */
+    suspend fun read(bitmap: Bitmap): RecognizedText {
+        return suspendCancellableCoroutine { cont ->
+            try {
+                recognizer.process(InputImage.fromBitmap(bitmap, 0)).addOnCompleteListener { task ->
+                    try {
+                        if (!cont.isActive) return@addOnCompleteListener
+                        if (!task.isSuccessful) throw task.exception ?: IllegalStateException("Text recognition failed")
+                        val result = task.result
+                        val lines = result.textBlocks.flatMap { it.lines }.mapNotNull { l ->
+                            val box = l.boundingBox ?: return@mapNotNull null
+                            l.text.trim().takeIf { it.isNotEmpty() }?.let { OcrLine(it, box.centerX(), box.centerY(), box.left, box.top, box.right, box.bottom) }
+                        }.sortedWith(compareBy({ it.y / ROW_PX }, { it.x }))
+                        cont.resume(RecognizedText(lines, lines.map(bitmap::visualStamp)))
+                    } catch (e: Exception) {
+                        if (cont.isActive) cont.resumeWithException(e)
+                    } finally { bitmap.recycle() }
+                }
+            } catch (e: Exception) {
+                bitmap.recycle()
+                if (cont.isActive) cont.resumeWithException(e)
+            }
         }
-        return result.textBlocks.flatMap { it.lines }.mapNotNull { l ->
-            val box = l.boundingBox ?: return@mapNotNull null
-            l.text.trim().takeIf { it.isNotEmpty() }?.let { OcrLine(it, box.centerX(), box.centerY()) }
-        }.sortedWith(compareBy({ it.y / ROW_PX }, { it.x }))
     }
 
     companion object {

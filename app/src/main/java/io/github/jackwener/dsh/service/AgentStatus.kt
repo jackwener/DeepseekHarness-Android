@@ -66,7 +66,7 @@ object AgentStatus {
         }
         val tools = turn?.blocks.orEmpty().filterIsInstance<Block.Tool>()
         val last = tools.lastOrNull()
-        val background = hasAgentScreen && last != null && (last.name.startsWith("screen_") || last.name in BACKGROUND_TOOLS) &&
+        val background = hasAgentScreen && last != null && (last.name.startsWith("screen_") || last.name.startsWith("phone_") || last.name in BACKGROUND_TOOLS) &&
             (last.args?.get("screen") as? JsonPrimitive)?.contentOrNull != "main"
         return CapsuleStatus.Working(tools.lastOrNull { it.state == ToolState.Running }, background)
     }

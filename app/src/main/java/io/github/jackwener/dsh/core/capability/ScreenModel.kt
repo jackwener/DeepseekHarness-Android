@@ -16,6 +16,9 @@ data class UiElement(
     val editable: Boolean = false,
     /** Status bar / notification shade (listed under its own header, ignored by diffs and fingerprints). */
     val system: Boolean = false,
+    val left: Int = x, val top: Int = y, val right: Int = x + 1, val bottom: Int = y + 1,
+    /** Collection keeps long native labels; ordinary screen listings retain their compact preview. */
+    val fullText: String? = null, val textClipped: Boolean = false,
 ) {
     /** What makes two reads' elements "the same": an edit field keeps its identity while its text changes. */
     val identity: String get() = if (editable) "$cls\u0000\u0000$desc\u0000$resId" else "$cls\u0000$text\u0000$desc\u0000$resId"
@@ -42,7 +45,12 @@ class Frame(val seq: Int, val packageName: String?, val elements: List<UiElement
     fun indexOf(id: String): Int? = index[id]
 
     /** Hash of what the app shows (texts and flags, system UI excluded): equal before and after = nothing happened. */
-    val fingerprint: Int by lazy { elements.filterNot { it.system }.map { it.content() }.hashCode() * 31 + (packageName?.hashCode() ?: 0) }
+    val fingerprint: Int by lazy { elements.filterNot { it.system }.map { it.content() to it.fullText }.hashCode() * 31 + (packageName?.hashCode() ?: 0) }
+
+    /** Settling and coordinate validation must notice motion even when the labels did not change. */
+    val layoutFingerprint: Int by lazy {
+        elements.filterNot { it.system }.map { listOf(it.content(), it.fullText, it.x, it.y, it.left, it.top, it.right, it.bottom) }.hashCode() * 31 + (packageName?.hashCode() ?: 0)
+    }
 
     /** Elements that carry readable text (few of them = custom-drawn UI, try text recognition). */
     val readableCount: Int get() = elements.count { !it.system && it.readable }

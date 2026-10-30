@@ -182,6 +182,12 @@ export function screenSection(descriptors = []) {
     ? '- App notes are UI facts earlier runs recorded on this phone; they are shown with the guide. After you find a non-obvious entry or hit a trap in an app, record ONE concise factual note with app_note (UI facts only: no personal data, nothing specific to this task). ' +
       'When you used a note, confirm it if it held, update or remove it if it was wrong.\n'
     : ''
+  const compound = descriptors.some(d => d.name === 'phone_run')
+    ? '- Use phone_run for a short, predictable sequence of native app steps. Match targets by text/resourceId/role; add wait/assert at asynchronous boundaries. It stops at uncertainty and reports completed steps: inspect the current screen and plan only what remains, never replay the whole sequence.\n'
+    : ''
+  const collect = descriptors.some(d => d.name === 'phone_collect')
+    ? '- Use phone_collect for reading a scrolling native app list across screens. Set the content region/container and bounds; inspect stopReason/truncated before claiming the list is complete.\n'
+    : ''
   return `Operating apps on screen:
 - ${where} Pass screen: "main" only to see or act on what the user is looking at ("how do I reply to this?"). Without Shizuku everything happens on the user's screen; the result says so.
 - Login, captcha, payment, a page that blocks screenshots, or a choice only the user can make: call hand_to_user(reason, kind) instead of guessing or typing credentials, then read the screen again when it returns.
@@ -189,7 +195,7 @@ export function screenSection(descriptors = []) {
 - A loop-guard warning in a result means you are repeating yourself without progress: change approach, or stop and report what blocks you. A refused call means stop and report.
 - Waits before sending, posting or replying are deliberate pacing so the app does not flag you as a bot; they are normal.
 - ${guide}
-${notes}
+${compound}${collect}${notes}
 `
 }
 

@@ -6,6 +6,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
@@ -55,15 +56,31 @@ class ToolResult(
     val outcome: ActionOutcome? = null,
     /** Fingerprint of the screen the call left behind ([Frame.fingerprint]), for the loop guard. */
     val screen: Int? = null,
+    /** Native compound tools consume this directly; it never crosses the engine bridge. */
+    val observation: ScreenObservation? = null,
 ) {
-    fun withOutcome(o: ActionOutcome?, screen: Int? = this.screen) = ToolResult(ok, content, errorCode, errorMessage, o, screen)
+    fun withOutcome(o: ActionOutcome?, screen: Int? = this.screen) = ToolResult(ok, content, errorCode, errorMessage, o, screen, observation)
+    fun withObservation(value: ScreenObservation) = ToolResult(ok, content, errorCode, errorMessage, outcome, screen, value)
+    fun failed(code: String, message: String) = ToolResult(false, content + Content.Text(message), code, message, outcome, screen, observation)
+
+    /** Keep compound progress machine-readable even when a bridge cancellation interrupts it. */
+    fun partialFailure(code: String, message: String): ToolResult {
+        val next = content.toMutableList()
+        val first = (next.firstOrNull() as? Content.Text)?.text
+        val json = first?.let { runCatching { Json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
+        if (json != null) next[0] = Content.Text(JsonObject(json + mapOf("stopReason" to JsonPrimitive(code)) +
+            (if ("items" in json) mapOf("truncated" to JsonPrimitive(true)) else emptyMap())).toString())
+        observation?.let { next += Content.Text("Last observed app: ${it.frame.packageName}\n${it.frame.render().take(6000)}") }
+        next += Content.Text(message)
+        return ToolResult(false, next, code, message, outcome, screen, observation)
+    }
 
     /** Adds a paragraph to the model-facing text (the error message too, for failed calls). */
     fun appendText(text: String): ToolResult {
         val i = content.indexOfLast { it is Content.Text }
         val next = if (i < 0) listOf(Content.Text(text)) + content
             else content.toMutableList().also { it[i] = Content.Text((it[i] as Content.Text).text + "\n\n" + text) }
-        return ToolResult(ok, next, errorCode, errorMessage?.let { "$it\n\n$text" }, outcome, screen)
+        return ToolResult(ok, next, errorCode, errorMessage?.let { "$it\n\n$text" }, outcome, screen, observation)
     }
 
     /** Puts a line before the model-facing text (e.g. which screen the call used). */
@@ -71,7 +88,7 @@ class ToolResult(
         val i = content.indexOfFirst { it is Content.Text }
         val next = if (i < 0) listOf(Content.Text(text)) + content
             else content.toMutableList().also { it[i] = Content.Text(text + "\n" + (it[i] as Content.Text).text) }
-        return ToolResult(ok, next, errorCode, errorMessage?.let { "$text\n$it" }, outcome, screen)
+        return ToolResult(ok, next, errorCode, errorMessage?.let { "$text\n$it" }, outcome, screen, observation)
     }
 
     companion object {
@@ -96,13 +113,22 @@ class CallContext(
     val callId: String,
     val unattended: Boolean,
     val deadlineMs: Long = Long.MAX_VALUE,
+    /** A new user turn invalidates an in-flight compound plan, including after permission waits. */
+    val checkCurrent: () -> Unit = {},
+    private val onProgress: (ToolResult) -> Unit = {},
 ) {
     @Volatile var waitingFor: String? = null
+    @Volatile var progress: ToolResult? = null
+        private set
+    fun report(result: ToolResult) { progress = result; onProgress(result) }
+    fun partialFailure(code: String, message: String): ToolResult? {
+        return progress?.partialFailure(code, message)
+    }
 
     /** Runs a user-facing wait, recording what it waits for (cleared when it ends or is cancelled). */
     suspend fun <T> waitFor(what: String, block: suspend () -> T): T {
         waitingFor = what
-        try { return block() } finally { waitingFor = null }
+        try { return block().also { checkCurrent() } } finally { waitingFor = null }
     }
 }
 

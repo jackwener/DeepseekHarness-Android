@@ -3,5 +3,8 @@
      corruption (suspected in native addons / OpenSSL) produces a precise tombstone "Cause:" line. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
-    <application android:gwpAsanMode="always" tools:targetApi="30" />
+    <application android:gwpAsanMode="always" tools:targetApi="30">
+        <!-- Non-exported deterministic native UI for connected tests; absent from release builds. -->
+        <activity android:name=".testing.PhoneFixtureActivity" android:exported="false" android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+    </application>
 </manifest>

@@ -25,6 +25,7 @@ android {
         targetSdk = 36
         versionCode = 15
         versionName = "0.2.5"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }
         // Bundled official Shizuku APK (in-app install/update); pinned in tools/fetch-shizuku.sh.
         buildConfigField("String", "SHIZUKU_VERSION", "\"${shizukuPin("VERSION")}\"")
@@ -44,6 +45,10 @@ android {
         }
     }
     buildTypes {
+        debug {
+            // Optional side-by-side real-device testing without replacing the user's installed app.
+            applicationIdSuffix = providers.gradleProperty("dsh.debugSuffix").orNull
+        }
         release {
             // R8 stays off until a minified build has been verified on a device.
             isMinifyEnabled = false
@@ -122,6 +127,8 @@ dependencies {
     implementation(libs.coil.compose)
     implementation(libs.markdown.m3)
     testImplementation(libs.junit)
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
     // Room migration tests on the JVM: the real SQLite engine runs the migration SQL against the exported schemas.
     testImplementation(libs.sqlite.jdbc)
     // Geofences on devices with Play services (background-FGS-start exempt); LocationManager otherwise.

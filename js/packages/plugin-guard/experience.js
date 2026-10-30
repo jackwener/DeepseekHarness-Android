@@ -17,7 +17,7 @@ const short = (s, n = 120) => {
 }
 
 /** Whether a tool call belongs in the trace: the app and screen tools that operate other apps. */
-export const traced = name => typeof name === 'string' && (name.startsWith('screen_') || name.startsWith('app_') || name === 'hand_to_user')
+export const traced = name => typeof name === 'string' && (name.startsWith('screen_') || name.startsWith('phone_') || name.startsWith('app_') || name === 'hand_to_user')
 
 /** Only the arguments that describe the step; typed text and links stay out (they may be personal). */
 function argsOf(name, a = {}) {

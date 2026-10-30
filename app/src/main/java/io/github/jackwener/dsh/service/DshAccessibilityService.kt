@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
+import android.os.SystemClock
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -20,6 +21,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.concurrent.Executors
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 
 /**
@@ -30,6 +32,10 @@ class DshAccessibilityService : AccessibilityService() {
 
     /** One shared thread for screenshot callbacks (a new executor per capture leaked a thread each time). */
     private val shotExecutor = Executors.newSingleThreadExecutor()
+    private val changes = ConcurrentHashMap<Int, Long>()
+
+    /** Only events for the requested display affect its wait; a busy main screen cannot stall an agent screen. */
+    fun lastContentChange(displayId: Int): Long = changes[displayId] ?: 0L
 
     override fun onServiceConnected() { instance = this }
     override fun onUnbind(intent: android.content.Intent?): Boolean { instance = null; return super.onUnbind(intent) }
@@ -37,6 +43,20 @@ class DshAccessibilityService : AccessibilityService() {
     override fun onInterrupt() {}
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
+        if (event.eventType in setOf(AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED, AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
+                AccessibilityEvent.TYPE_VIEW_SCROLLED, AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) && event.packageName?.toString() != SYSTEM_UI) {
+            val display = if (Build.VERSION.SDK_INT >= 33) event.displayId else if (Build.VERSION.SDK_INT >= 30) {
+                // Older Android has no event.displayId: resolve its window, never broadcast to all displays.
+                val all = windowsOnAllDisplays
+                (0 until all.size()).firstOrNull { i -> all.valueAt(i).any { it.id == event.windowId } }?.let(all::keyAt)
+            } else Display.DEFAULT_DISPLAY
+            if (display != null && display >= 0) {
+                // Events can be batched by notificationTimeout. Their original uptime avoids
+                // adding that delivery delay again to the post-action quiet interval.
+                val at = SystemClock.elapsedRealtime() - (SystemClock.uptimeMillis() - event.eventTime).coerceAtLeast(0)
+                changes.merge(display, at, ::maxOf)
+            }
+        }
         // A click on the user's own screen: what opens there next is the user's doing (AgentScreen.pullBack).
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
             val pkg = event.packageName?.toString()
@@ -130,8 +150,10 @@ class DshAccessibilityService : AccessibilityService() {
 
     private fun walk(n: AccessibilityNodeInfo, depth: Int, system: Boolean, out: MutableList<AccessibilityNodeInfo>, els: MutableList<UiElement>) {
         if (!n.isVisibleToUser) return
-        val text = n.text?.toString()?.take(120)
-        val desc = n.contentDescription?.toString()?.take(120)
+        val rawText = n.text?.toString()
+        val rawDesc = n.contentDescription?.toString()
+        val text = rawText?.take(120)
+        val desc = rawDesc?.take(120)
         val interesting = !text.isNullOrBlank() || !desc.isNullOrBlank() || n.isClickable || n.isEditable || n.isScrollable || n.isCheckable
         var d = depth
         if (interesting && depth < 40) {
@@ -142,8 +164,10 @@ class DshAccessibilityService : AccessibilityService() {
                 if (n.isScrollable) add("scroll"); if (n.isCheckable) add(if (n.isChecked) "checked" else "unchecked")
                 if (!n.isEnabled) add("disabled"); if (n.isFocused) add("focused")
             }
+            val label = if (n.isPassword) null else rawText?.takeIf { it.isNotBlank() } ?: rawDesc
             els += UiElement(n.className?.toString()?.substringAfterLast('.') ?: "View", text, desc, n.viewIdResourceName?.substringAfter(":id/"),
-                r.centerX(), r.centerY(), depth, flags, n.isEditable, system)
+                r.centerX(), r.centerY(), depth, flags, n.isEditable, system, r.left, r.top, r.right, r.bottom,
+                label?.takeIf { it.length > 120 }?.take(8192), (label?.length ?: 0) > 8192)
             d = depth + 1
         }
         for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, d, system, out, els) }
@@ -184,8 +208,10 @@ class DshAccessibilityService : AccessibilityService() {
                 override fun onSuccess(result: ScreenshotResult) {
                     val hw = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
                     val bmp = hw?.copy(Bitmap.Config.ARGB_8888, false)
+                    hw?.recycle()
                     result.hardwareBuffer.close()
-                    if (cont.isActive) cont.resume(Capture(bmp, null))
+                    if (cont.isActive) cont.resume(Capture(bmp, null)) { _, capture, _ -> capture.bitmap?.recycle() }
+                    else bmp?.recycle()
                 }
                 override fun onFailure(errorCode: Int) { if (cont.isActive) cont.resume(Capture(null, errorCode)) }
             })

@@ -9,6 +9,15 @@ const guide = { name: 'app_guide', group: 'apps', risk: 'read', needsUnlock: fal
 const note = { name: 'app_note', group: 'apps', risk: 'read', needsUnlock: false }
 const alarm = { name: 'alarm_set', group: 'system', risk: 'write', needsUnlock: false }
 
+test('compound phone guidance is conditional and warns against replaying completed actions', () => {
+  const run = { name: 'phone_run', group: 'screen', risk: 'write', needsUnlock: true }
+  const collect = { ...run, name: 'phone_collect' }
+  const text = screenSection([screen, run, collect])
+  for (const part of ['phone_run', 'phone_collect', 'never replay', 'stopReason/truncated']) assert.ok(text.includes(part), part)
+  assert.ok(!screenSection([screen]).includes('phone_run'))
+  assert.ok(!screenSection([screen]).includes('phone_collect'))
+})
+
 test('screen operation section only when screen tools are registered', () => {
   const withScreen = systemPromptSection('zh-CN', [screen, launch, guide, alarm])
   for (const s of ['background screen', 'screen: "main"', 'hand_to_user(reason, kind)', 'loop-guard', 'pacing', 'app_launch / app_open_link', 'app_guide(app)'])

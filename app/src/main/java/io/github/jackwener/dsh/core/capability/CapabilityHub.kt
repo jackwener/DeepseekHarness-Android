@@ -15,6 +15,7 @@ import io.github.jackwener.dsh.core.capability.tools.MediaTools
 import io.github.jackwener.dsh.core.capability.tools.NotificationTools
 import io.github.jackwener.dsh.core.capability.tools.RuleTools
 import io.github.jackwener.dsh.core.capability.tools.ScreenTools
+import io.github.jackwener.dsh.core.capability.tools.PhoneTools
 import io.github.jackwener.dsh.core.capability.tools.SystemTools
 import io.github.jackwener.dsh.core.data.RuleDao
 import io.github.jackwener.dsh.core.data.SettingsRepository
@@ -75,7 +76,7 @@ class CapabilityHub @Inject constructor(
     private val sessions: Lazy<SessionStore>,
     files: FileTools, apps: AppTools, screen: ScreenTools, system: SystemTools, notifications: NotificationTools,
     comms: CommsTools, media: MediaTools, clipboard: ClipboardTools, browser: BrowserTools, ruleTools: RuleTools,
-    knowledge: KnowledgeTools,
+    knowledge: KnowledgeTools, phone: PhoneTools,
     private val shellGate: ShellGate,
     private val guard: ActionGuard,
     private val agentScreen: AgentScreen,
@@ -83,13 +84,15 @@ class CapabilityHub @Inject constructor(
     private val experience: AppExperience,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    val allTools: Map<String, Tool> = listOf(files, apps, screen, system, notifications, comms, media, clipboard, browser, ruleTools, knowledge)
+    val allTools: Map<String, Tool> = listOf(files, apps, screen, system, notifications, comms, media, clipboard, browser, ruleTools, knowledge, phone)
         .flatMap { it.tools }.associateBy { it.name }
     @Volatile private var bridge: JsonRpcPeer? = null
     private val liveSeq = java.util.concurrent.atomic.AtomicLong()
     private val _live = MutableStateFlow<Map<Long, LiveCall>>(emptyMap())
     /** Calls executing now, keyed per call: read-only, for status surfaces outside the app (floating ball). */
     val liveCalls: StateFlow<Map<Long, LiveCall>> = _live.asStateFlow()
+    private val turns = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>()
+    private fun turn(session: String) = turns.getOrPut(session.substringBefore('/')) { java.util.concurrent.atomic.AtomicLong() }
 
     init {
         scope.launch {
@@ -172,13 +175,15 @@ class CapabilityHub @Inject constructor(
         val key = callKey(sessionId, callId)
         // Own job (so capability/cancel can target this call), linked both ways to the engine request:
         // the request's cancellation (EngineCalls: teardown / EOF) cancels it below, and it keeps the Call element.
-        val job = scope.async(currentCoroutineContext()[io.github.jackwener.dsh.core.engine.EngineCalls.Call] ?: kotlin.coroutines.EmptyCoroutineContext) { invoke(params) }
+        val progress = java.util.concurrent.atomic.AtomicReference<ToolResult?>()
+        val job = scope.async(currentCoroutineContext()[io.github.jackwener.dsh.core.engine.EngineCalls.Call] ?: kotlin.coroutines.EmptyCoroutineContext) { invoke(params, progress::set) }
         inFlight.put(key, job)?.cancel(CancellationException("superseded by a new call with the same id"))
         return try {
             job.await()
         } catch (e: CancellationException) {
             if (!currentCoroutineContext().isActive) { job.cancel(); throw e }
-            ToolResult.error("cancelled", "The call was cancelled (${e.message ?: "cancelled"}) before it acted; nothing was done.")
+            val message = "The call was cancelled (${e.message ?: "cancelled"}). An in-flight action may already have happened; inspect the current screen before continuing. Do not replay completed steps."
+            progress.get()?.partialFailure("cancelled", message) ?: ToolResult.error("cancelled", message)
         } finally {
             inFlight.remove(key, job)
         }
@@ -190,41 +195,38 @@ class CapabilityHub @Inject constructor(
      * (`timeoutMs` from the request, else the tool's descriptor) and is cancelled with the call; the
      * tool itself only starts once those waits are over and the call is still live.
      */
-    suspend fun invoke(params: JsonObject): ToolResult {
+    suspend fun invoke(params: JsonObject, onProgress: (ToolResult) -> Unit = {}): ToolResult {
         val name = params["tool"]?.jsonPrimitive?.contentOrNull ?: return ToolResult.error("invalid_args", "missing tool")
         val sessionId = params["sessionId"]?.jsonPrimitive?.contentOrNull ?: ""
         val callId = params["callId"]?.jsonPrimitive?.contentOrNull ?: ""
         val args = (params["args"] as? JsonObject) ?: JsonObject(emptyMap())
         val tool = allTools[name] ?: return ToolResult.error("invalid_args", "unknown tool $name")
-        val group = ToolGroup.of(tool.descriptor.group)
-        if (group !in settings.current().enabledGroups) return ToolResult.error("not_authorized",
-            "The '${tool.descriptor.group}' capability is turned off. Ask the user to enable it in DSH → Settings → Agent.")
-        // Backstop for session modes (plugin-mode already hides these tools from the conversation).
-        if (group != null && !sessions.get().modeAllowsGroup(sessionId, group)) return ToolResult.error("not_authorized",
-            "The '${tool.descriptor.group}' tools are not available in this conversation's mode; nothing was done. Tell the user it needs a conversation in another mode.")
+        authorize(tool, sessionId)?.let { return it }
         val ruleId = ruleIdOfSession(sessionId)
-        if (ruleId != null) {
-            val spec = rules.get(ruleId)?.let { e -> runCatching { RpcJson.decodeFromString(RuleSpec.serializer(), e.specJson) }.getOrNull() }
-            if (spec == null || name !in spec.allowedTools) return ToolResult.error("not_authorized",
-                "tool_not_authorized: '$name' is not in this automation's approved tool list.")
-        }
         val unattended = ruleId != null
         val requested = params["timeoutMs"]?.jsonPrimitive?.longOrNull?.takeIf { it > 0 }
         // Bridge calls carry the engine's timeout; rule steps (no engine) may wait longer for an unlock.
-        val budget = requested ?: if (sessionId.isEmpty() || unattended && tool.needsUnlock) UNATTENDED_UNLOCK_WAIT_MS else tool.descriptor.timeoutMs
+        val compound = name == "phone_run" || name == "phone_collect"
+        val budget = if (compound) minOf(requested ?: tool.descriptor.timeoutMs, tool.descriptor.timeoutMs)
+            else requested ?: if (sessionId.isEmpty() || unattended && tool.needsUnlock) UNATTENDED_UNLOCK_WAIT_MS else tool.descriptor.timeoutMs
         // Answer a little before the engine gives up, so the model gets a clear result instead of a bare timeout.
         val budgetMs = (budget - ANSWER_MARGIN_MS).coerceAtLeast(budget / 2)
-        val call = CallContext(sessionId, callId, unattended, SystemClock.elapsedRealtime() + budgetMs)
+        val version = turn(sessionId).get()
+        val call = CallContext(sessionId, callId, unattended, SystemClock.elapsedRealtime() + budgetMs, {
+            if (turn(sessionId).get() != version) throw InvalidArgsException("A new user message superseded this plan; stop and inspect the current state.")
+        }, onProgress)
         val liveKey = liveSeq.incrementAndGet()
         // A screen call without an agent screen to act on works on the user's own screen (AgentScreen.target).
-        val mainScreen = name.startsWith("screen_") && (args.str("screen") == "main" || agentScreen.current(sessionId) == null)
+        val mainScreen = (name.startsWith("screen_") || name.startsWith("phone_")) && (args.str("screen") == "main" || agentScreen.current(sessionId) == null)
         _live.update { it + (liveKey to LiveCall(sessionId, name, mainScreen, acts = tool.descriptor.risk != Risk.read)) }
         val result = try {
             withTimeoutOrNull(budgetMs) { run(tool, name, args, call) }?.also { experience.observe(sessionId, name, args, it) }
         } finally {
             _live.update { it - liveKey }
         }
-        return result ?: call.waitingFor.let { waiting ->
+        if (result != null) return result
+        call.partialFailure("timeout", "The call deadline expired. Completed steps were not rolled back; the in-flight step may have acted. Read the screen before continuing, and do not replay the plan.")?.let { return it }
+        return call.waitingFor.let { waiting ->
             if (waiting != null) ToolResult.error("waiting_for_user",
                 "Still waiting for the user to $waiting after ${budgetMs / 1000}s, so the call was cancelled and nothing was done. " +
                     "Call the tool again when the user is ready, or tell them what is needed.")
@@ -238,6 +240,7 @@ class CapabilityHub @Inject constructor(
      * start over ([text] ranks app notes), and agent-screen actions resume after a 我来接管.
      */
     fun onUserPrompt(sessionId: String, text: String = "") {
+        turn(sessionId).incrementAndGet()
         guard.reset(sessionId)
         appKnowledge.newTurn(sessionId, text)
         experience.newTurn(sessionId, text)
@@ -246,8 +249,34 @@ class CapabilityHub @Inject constructor(
 
     /** Screen and app calls pass the loop guard (docs/AGENT-SCREEN-V2.md §3.5): refused once stopped, reminders appended. */
     private suspend fun run(tool: Tool, name: String, args: JsonObject, call: CallContext): ToolResult {
+        // A compound tool is a container: its individual calls go through this gate and are counted once.
+        if (name == "phone_run" || name == "phone_collect") return execute(tool, name, args, call)
         guard.before(call.sessionId, tool, args)?.let { return it }
         return guard.after(call.sessionId, tool, args, execute(tool, name, args, call))
+    }
+
+    /** Same gates and deadline as ordinary calls. A compound plan cannot grant its child tools permission. */
+    suspend fun invokeNested(name: String, args: JsonObject, call: CallContext): ToolResult {
+        require(name in setOf("app_launch", "screen_read", "screen_tap", "screen_type", "screen_scroll", "screen_swipe", "screen_key", "screen_wait"))
+        currentCoroutineContext().ensureActive()
+        call.checkCurrent()
+        val tool = allTools.getValue(name)
+        authorize(tool, call.sessionId)?.let { return it }
+        return run(tool, name, args, call).also { experience.observe(call.sessionId, name, args, it) }
+    }
+
+    private suspend fun authorize(tool: Tool, sessionId: String): ToolResult? {
+        val group = ToolGroup.of(tool.descriptor.group)
+        if (group !in settings.current().enabledGroups) return ToolResult.error("not_authorized",
+            "The '${tool.descriptor.group}' capability is turned off. Enable it in DSH → Settings → Agent.")
+        if (group != null && !sessions.get().modeAllowsGroup(sessionId, group)) return ToolResult.error("not_authorized",
+            "The '${tool.descriptor.group}' tools are not available in this conversation's mode; nothing was done.")
+        ruleIdOfSession(sessionId)?.let { id ->
+            val spec = rules.get(id)?.let { runCatching { RpcJson.decodeFromString(RuleSpec.serializer(), it.specJson) }.getOrNull() }
+            if (spec == null || tool.name !in spec.allowedTools) return ToolResult.error("not_authorized",
+                "tool_not_authorized: '${tool.name}' is not in this automation's approved tool list.")
+        }
+        return null
     }
 
     private suspend fun execute(tool: Tool, name: String, args: JsonObject, call: CallContext): ToolResult {
@@ -273,6 +302,7 @@ class CapabilityHub @Inject constructor(
             while (result == null) {
                 // Re-check right before acting: a call cancelled while it waited must never run late.
                 io.github.jackwener.dsh.core.engine.EngineCalls.ensureCallActive()
+                call.checkCurrent()
                 try {
                     result = tool.invoke(args, call)
                 } catch (e: io.github.jackwener.dsh.core.platform.ShellUnavailableException) {

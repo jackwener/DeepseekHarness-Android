@@ -33,6 +33,10 @@ import io.github.jackwener.dsh.core.capability.PermissionMissingException
 import io.github.jackwener.dsh.core.capability.SchemaBuilder
 import io.github.jackwener.dsh.core.capability.ScreenDiff
 import io.github.jackwener.dsh.core.capability.ScreenOcr
+import io.github.jackwener.dsh.core.capability.ScreenObservation
+import io.github.jackwener.dsh.core.capability.ScreenSettling
+import io.github.jackwener.dsh.core.capability.VisualStamp
+import io.github.jackwener.dsh.core.capability.visualStamp
 import io.github.jackwener.dsh.core.capability.ScreenTarget
 import io.github.jackwener.dsh.core.capability.StableIds
 import io.github.jackwener.dsh.core.capability.TextInput
@@ -53,6 +57,7 @@ import io.github.jackwener.dsh.service.DshAccessibilityService
 import io.github.jackwener.dsh.service.ScreenSnapshot
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
@@ -83,13 +88,21 @@ class ScreenTools @Inject constructor(
         @Volatile var shown: Frame? = null
         @Volatile var reads = 0
         @Volatile var ocr: List<OcrLine> = emptyList()
+        var ocrIds: Map<String, OcrLine> = emptyMap()
+        var ocrTargets: Map<String, VisualStamp> = emptyMap()
+        var ocrStamp: VisualStamp? = null
+        var ocrTree: Int? = null
+        var ocrAt = 0L
+        var nextTextId = 1
+        var ocrError: String? = null
         @Volatile var lastPackage: String? = null
+        fun clearOcr() { ocr = emptyList(); ocrIds = emptyMap(); ocrTargets = emptyMap(); ocrStamp = null; ocrTree = null; ocrError = null }
     }
     private val views = ConcurrentHashMap<String, View>()
     private fun view(call: CallContext, d: Int) = views.getOrPut("${call.sessionId.substringBefore('/')}|$d") { View() }
 
     /** A live snapshot with stable ids assigned. */
-    private class Read(val snap: ScreenSnapshot, val frame: Frame)
+    private class Read(var snap: ScreenSnapshot, var frame: Frame)
 
     private fun svc() = DshAccessibilityService.instance ?: throw PermissionMissingException("Accessibility service (DSH screen control)")
 
@@ -104,7 +117,21 @@ class ScreenTools @Inject constructor(
         return null
     }
 
-    private suspend fun settle() = delay(400)
+    private suspend fun settle(call: CallContext, t: ScreenTarget, before: Frame?, requireChange: Boolean = true): ScreenSettling.Result {
+        val a11y = svc()
+        return ScreenSettling.await(before?.layoutFingerprint ?: read(call, t.displayId).frame.layoutFingerprint,
+            requireChange, SystemClock::elapsedRealtime, {
+                call.checkCurrent()
+                val f = read(call, t.displayId).frame
+                ScreenSettling.Sample(f.layoutFingerprint, a11y.lastContentChange(t.displayId))
+            }, limitMs = minOf(1_800, (call.deadlineMs - SystemClock.elapsedRealtime()).coerceAtLeast(1)))
+    }
+
+    private fun observation(call: CallContext, t: ScreenTarget, r: Read, stop: String? = null): ScreenObservation {
+        val m = metrics(t.displayId)
+        val v = view(call, t.displayId)
+        return ScreenObservation(r.frame, t.displayId, m.widthPixels, m.heightPixels, v.ocr, stop ?: v.ocrError, v.ocrIds)
+    }
 
     private fun metrics(displayId: Int): DisplayMetrics = DisplayMetrics().also { m ->
         val dm = context.getSystemService(DisplayManager::class.java)
@@ -132,21 +159,62 @@ class ScreenTools @Inject constructor(
      */
     private suspend fun full(call: CallContext, t: ScreenTarget, r: Read, max: Int, forceOcr: Boolean): String {
         val v = view(call, t.displayId)
+        val recognized = ocrSection(call, t, r, v, forceOcr)
         val g = ++v.reads
         if (r.frame.packageName != null || r.frame.elements.isNotEmpty()) v.shown = r.frame
-        return "${header(r.frame, t, g)}\n${body(r.frame, max)}" + ocrSection(t, r.frame, v, forceOcr) + visit(call, t, r.frame)
+        return "${header(r.frame, t, g)}\n${body(r.frame, max)}" + recognized + visit(call, t, r.frame)
     }
 
     /** Text recognition fallback (§3.3); also resets the `t` ids when not run. */
-    private suspend fun ocrSection(t: ScreenTarget, f: Frame, v: View, force: Boolean): String {
-        if (!force && f.readableCount >= ScreenOcr.SPARSE) { v.ocr = emptyList(); return "" }
-        val bmp = screenshot(t)
-        if (bmp == null) { v.ocr = emptyList(); return if (force) "\n(text recognition unavailable: no screenshot of this screen)" else "" }
-        if (isBlank(bmp)) { v.ocr = emptyList(); return if (force) "\n(text recognition skipped: the page is protected)" else "" }
-        val lines = runCatching { ocr.read(bmp) }.getOrElse { v.ocr = emptyList(); return "\n(text recognition failed: ${it.message})" }
-        v.ocr = lines
-        if (lines.isEmpty()) return "\n-- text recognized from the screenshot: none --"
-        return "\n-- text recognized from the screenshot (tap with node \"t<n>\") --\n" + ScreenOcr.render(lines)
+    private suspend fun ocrSection(call: CallContext, t: ScreenTarget, r: Read, v: View, force: Boolean): String {
+        v.clearOcr()
+        if (!force && r.frame.readableCount >= ScreenOcr.SPARSE) return ""
+        try {
+            val accepted = withTimeoutOrNull(8_000) {
+                repeat(2) {
+                    // A quiet tree alone is insufficient for a canvas: compare two captured frames as well.
+                    settle(call, t, r.frame, requireChange = false)
+                    val fresh = read(call, t.displayId)
+                    r.snap = fresh.snap; r.frame = fresh.frame
+                    val a = screenshot(t) ?: return@withTimeoutOrNull false
+                    val stamp = try { if (isBlank(a)) return@withTimeoutOrNull false; a.visualStamp() } finally { a.recycle() }
+                    delay(120)
+                    val b = screenshot(t) ?: return@withTimeoutOrNull false
+                    val before = b.visualStamp()
+                    if (!stamp.same(before) || read(call, t.displayId).frame.layoutFingerprint != r.frame.layoutFingerprint) {
+                        b.recycle(); return@repeat
+                    }
+                    // ScreenOcr owns b until ML Kit completes, including cancellation.
+                    val recognized = ocr.read(b)
+                    val c = screenshot(t) ?: return@withTimeoutOrNull false
+                    val unchanged = try {
+                        before.same(c.visualStamp()) && recognized.lines.indices.all { i ->
+                            recognized.targets[i].same(c.visualStamp(recognized.lines[i]), .01)
+                        }
+                    } finally { c.recycle() }
+                    if (!unchanged || read(call, t.displayId).frame.layoutFingerprint != r.frame.layoutFingerprint) return@repeat
+                    v.ocr = recognized.lines
+                    val ids = recognized.lines.map { "t${v.nextTextId++}" }
+                    v.ocrIds = ids.zip(recognized.lines).toMap()
+                    v.ocrTargets = ids.zip(recognized.targets).toMap()
+                    v.ocrStamp = before; v.ocrTree = r.frame.layoutFingerprint; v.ocrAt = SystemClock.elapsedRealtime()
+                    return@withTimeoutOrNull true
+                }
+                false
+            }
+            if (accepted != true) {
+                v.clearOcr(); v.ocrError = "ocr_unstable_or_unavailable"
+                val fresh = read(call, t.displayId); r.snap = fresh.snap; r.frame = fresh.frame
+                return "\n(Text recognition did not obtain a consistent readable frame; no text ids were issued. Read again after the page settles.)"
+            }
+        } catch (e: CancellationException) { throw e
+        } catch (e: Exception) {
+            v.clearOcr(); v.ocrError = "ocr_failed"
+            return "\n(Text recognition failed: ${e.message}; no text ids were issued.)"
+        }
+        if (v.ocr.isEmpty()) return "\n-- text recognized from the screenshot: none --"
+        return "\n-- text recognized from a verified screenshot (text ids expire when the page changes) --\n" +
+            v.ocrIds.entries.joinToString("\n") { (id, l) -> "[$id] \"${l.text}\" @${l.x},${l.y}" }
     }
 
     /** First time in an app: its usage knowledge, if any. The agent screen also mutes apps that arrive on it. */
@@ -177,7 +245,7 @@ class ScreenTools @Inject constructor(
      * unless the page changed.
      */
     private suspend fun after(call: CallContext, t: ScreenTarget, before: Frame?, done: String, watch: AgentScreen.Watch? = null): ToolResult {
-        settle()
+        val settled = if (DshAccessibilityService.instance != null) settle(call, t, before) else null
         val spill = agent.pullBack(call.sessionId, watch)
         if (t.agent && agent.showsProtected(t.displayId)) return protectedScreen(call, t, "screen")
         if (DshAccessibilityService.instance == null) return ToolResult.text(done)
@@ -196,7 +264,7 @@ class ScreenTools @Inject constructor(
                 val g = ++v.reads
                 v.shown = r.frame
                 val stale = if (v.ocr.isNotEmpty()) "\nText ids (t…) from earlier reads are no longer valid; use screen_read with ocr: true for new ones." else ""
-                v.ocr = emptyList()
+                v.clearOcr()
                 (if (diff.empty) "Screen unchanged since read #${g - 1} (read #$g)."
                 else "Screen now (read #$g) — changes since read #${g - 1}; everything else is unchanged:\n" + diff.render(shown, r.frame).trimEnd()) +
                     stale + visit(call, t, r.frame)
@@ -210,12 +278,19 @@ class ScreenTools @Inject constructor(
             LimitNotice.find(before, r.frame)?.let {
                 add("Effect: the app says \"$it\" — it is limiting these actions. Stop repeating them and tell the user.")
             }
-            if (before != null && r.frame.packageName != before.packageName && r.frame.packageName != null)
-                add("Effect: switched to ${agent.label(r.frame.packageName)} (${r.frame.packageName}).")
+            val pkg = r.frame.packageName
+            if (before != null && pkg != before.packageName && pkg != null)
+                add("Effect: switched to ${agent.label(pkg)} ($pkg).")
             spill?.let(::add)
         }
         return ToolResult.text((listOf(done) + effects + screenText).joinToString("\n"))
             .withOutcome(if (noEffect) ActionOutcome.NoEffect else ActionOutcome.Effective, r.frame.fingerprint)
+            .withObservation(observation(call, t, r, when {
+                LimitNotice.find(before, r.frame) != null -> "app_rate_limited"
+                spill != null -> "app_moved_to_another_screen"
+                settled?.quiet == false -> "screen_unstable"
+                else -> null
+            }))
     }
 
     private companion object {
@@ -246,6 +321,7 @@ class ScreenTools @Inject constructor(
     /** A protected (FLAG_SECURE) page cannot be seen, so it is not operated blind: it goes to the user. */
     private suspend fun protectedScreen(call: CallContext, t: ScreenTarget, toolName: String): ToolResult {
         val pkg = DshAccessibilityService.instance?.snapshot(t.displayId)?.packageName ?: "this app"
+        if (call.progress != null) return ToolResult.error("needs_user", "The page is protected; the compound operation stopped. Use hand_to_user, then inspect the screen before planning any remaining steps.")
         return takeover(call, t, toolName, "${agent.label(pkg)} 的当前页面禁止截图（支付、密码等安全页面），需要你在手机上完成这一步。", "secure_page",
             "The screen of $pkg is protected (screenshots are blocked)")
     }
@@ -278,7 +354,7 @@ class ScreenTools @Inject constructor(
             TakeoverAnswer.Handled -> {
                 val back = agent.takeBack(sid)
                 val now = agent.target(sid, if (t.agent) null else "main")
-                settle()
+                if (DshAccessibilityService.instance != null) settle(call, now, null, requireChange = false)
                 val screen = DshAccessibilityService.instance?.let { "\nScreen now — ${full(call, now, read(call, now.displayId), 6000, forceOcr = false)}" } ?: ""
                 ToolResult.text("$why; the user handled it and tapped 处理好了." + (if (back) " The app is back on the agent screen." else "") +
                     " Continue from the screen below; do not ask them to repeat it.$screen")
@@ -292,13 +368,14 @@ class ScreenTools @Inject constructor(
     private class Hit(val node: AccessibilityNodeInfo?, val x: Int, val y: Int, val label: String?, val note: String? = null)
 
     /** Resolves `node` (e…, t…, or a bare number) / `text` against the fresh read [r]. Null when neither was given. */
-    private fun locate(call: CallContext, d: Int, args: JsonObject, r: Read): Hit? {
+    private suspend fun locate(call: CallContext, d: Int, args: JsonObject, r: Read): Hit? {
         args.str("node")?.takeIf { it.isNotBlank() }?.let { raw ->
             val id = StableIds.normalize(raw)
             val v = view(call, d)
             if (id.startsWith("t")) {
-                val line = id.drop(1).toIntOrNull()?.let { v.ocr.getOrNull(it - 1) }
+                val line = v.ocrIds[id]
                     ?: throw InvalidArgsException("Unknown text id $raw; call screen_read again (text ids come from text recognition)")
+                verifyTextTarget(call, d, r, v, id, line)
                 return Hit(null, line.x, line.y, line.text)
             }
             return when (val l = v.ids.resolve(id, r.frame)) {
@@ -313,9 +390,29 @@ class ScreenTools @Inject constructor(
         val i = els.indexOfFirst { it.text == text || it.desc == text }.takeIf { it >= 0 }
             ?: els.indexOfFirst { (it.label ?: "").contains(text, ignoreCase = true) }.takeIf { it >= 0 }
         if (i != null) return hit(r, i, null)
-        val line = view(call, d).ocr.firstOrNull { it.text.contains(text, ignoreCase = true) }
+        val v = view(call, d)
+        val entry = v.ocrIds.entries.singleOrNull { it.value.text.contains(text, ignoreCase = true) }
             ?: throw InvalidArgsException("No element with text '$text'; call screen_read")
+        val line = entry.value
+        verifyTextTarget(call, d, r, v, entry.key, line)
         return Hit(null, line.x, line.y, line.text)
+    }
+
+    private suspend fun verifyTextTarget(call: CallContext, d: Int, r: Read, v: View, id: String, line: OcrLine) {
+        var valid = v.ocrTree == r.frame.layoutFingerprint && SystemClock.elapsedRealtime() - v.ocrAt <= 15_000
+        if (valid) {
+            val t = ScreenTarget(d, d != Display.DEFAULT_DISPLAY)
+            val bmp = screenshot(t)
+            valid = bmp != null && try {
+                v.ocrStamp?.same(bmp.visualStamp()) == true && v.ocrTargets[id]?.same(bmp.visualStamp(line), .01) == true &&
+                    read(call, d).frame.layoutFingerprint == v.ocrTree
+            } finally { bmp?.recycle() }
+        }
+        call.checkCurrent()
+        if (!valid) {
+            v.clearOcr()
+            throw InvalidArgsException("Text target $id is stale: the screen changed or its capture expired. Nothing was tapped; call screen_read for fresh text ids.")
+        }
     }
 
     private fun hit(r: Read, i: Int, note: String?): Hit {
@@ -379,6 +476,7 @@ class ScreenTools @Inject constructor(
                 val text = full(call, t, r, 12000, forceOcr = args.bool("ocr") == true)
                 val unchanged = same && textBefore == v.ocr.map { it.text }
                 return ToolResult.text(text).withOutcome(if (unchanged) ActionOutcome.ReadUnchanged else ActionOutcome.ReadChanged, r.frame.fingerprint)
+                    .withObservation(observation(call, t, r))
             }
         },
         object : ScreenTool("screen_capture", Risk.read, true,
@@ -420,7 +518,7 @@ class ScreenTools @Inject constructor(
                 // Coordinates still work through Shizuku alone, without effects (no accessibility tree to compare).
                 if (DshAccessibilityService.instance == null && px != null && py != null && shizuku.available)
                     return ToolResult.text(if (tapAt(px.toFloat(), py.toFloat(), long, d)) "Tapped at $px,$py (Shizuku; no accessibility service, so the effect is unknown)" else "Tap was cancelled")
-                fun target(r: Read) = locate(call, d, args, r) ?: run {
+                suspend fun target(r: Read) = locate(call, d, args, r) ?: run {
                     val x = px ?: throw InvalidArgsException("Give node, text, or x/y")
                     val y = py ?: throw InvalidArgsException("missing y")
                     Hit(null, x, y, labelAt(r, x, y))
@@ -430,6 +528,7 @@ class ScreenTools @Inject constructor(
                 // The wait can be long: find the target again on the screen as it is after it.
                 val paced = pace(call, r.frame.packageName, hit)?.also { r = read(call, d); hit = target(r) }
                 val watch = if (t.agent) agent.watch(call.sessionId) else null
+                call.checkCurrent()
                 val c = hit.node?.takeIf { it.refresh() }?.let(::clickable)
                 var tapped = true
                 val done = if (c != null && c.performAction(if (long) AccessibilityNodeInfo.ACTION_LONG_CLICK else AccessibilityNodeInfo.ACTION_CLICK)) {
@@ -440,7 +539,8 @@ class ScreenTools @Inject constructor(
                     if (tapped) "Tapped at $x,$y" + (hit.label?.let { " [$it]" } ?: "") else "Tap was cancelled"
                 }
                 if (tapped && outward(hit)) r.frame.packageName?.let { guard.pacing.noteDone(it, SystemClock.elapsedRealtime()) }
-                return after(call, t, r.frame, listOfNotNull(paced, hit.note, done).joinToString("\n"), watch)
+                val result = after(call, t, r.frame, listOfNotNull(paced, hit.note, done).joinToString("\n"), watch)
+                return if (tapped) result else result.failed("gesture_cancelled", "Android cancelled the tap; inspect the screen before retrying.")
             }
 
             private suspend fun tapAt(x: Float, y: Float, long: Boolean, d: Int): Boolean {
@@ -463,14 +563,18 @@ class ScreenTools @Inject constructor(
                 val d = t.displayId
                 val r = read(call, d)
                 val hit = locate(call, d, args.only("node"), r)
+                if (hit != null && hit.node?.isEditable != true) throw InvalidArgsException("The selected target is not an editable element; tap its current text id to focus it first.")
                 val target = hit?.node ?: focusedInput(d, r)
-                val out = textInput.type(svc(), target, args.reqStr("text"), args.bool("append") == true, d)
+                call.checkCurrent()
+                val out = textInput.type(svc(), target, args.str("text") ?: throw InvalidArgsException("missing text"), args.bool("append") == true, d)
                     ?: return ToolResult.error("input_failed", if (target == null) "No focused input field; tap the field first, then call screen_type again."
                         else "The field did not accept text by any method (set text, keyboard, Shizuku, paste). Tap the field and retry, or ask the user to type it.")
                 val watch = if (t.agent) agent.watch(call.sessionId) else null
-                val submitted = if (args.bool("submit") == true) " and pressed " + (pressEnter(false, d, r) ?: "Enter (failed: no method worked)") else ""
-                return after(call, t, r.frame, listOfNotNull(hit?.note, "Entered text (${out.method})$submitted" +
+                val submit = if (args.bool("submit") == true) pressEnter(false, d, r) else null
+                val submitted = submit?.let { " and pressed $it" } ?: ""
+                val result = after(call, t, r.frame, listOfNotNull(hit?.note, "Entered text (${out.method})$submitted" +
                     (out.fieldText?.let { "; the field now shows: \"${it.take(300)}\"" } ?: "")).joinToString("\n"), watch)
+                return if (args.bool("submit") == true && submit == null) result.failed("submit_failed", "Text was entered, but Enter failed. Do not type it again; inspect the screen.") else result
             }
 
             private fun focusedInput(d: Int, r: Read): AccessibilityNodeInfo? =
@@ -486,8 +590,9 @@ class ScreenTools @Inject constructor(
                 val d = t.displayId
                 fun i(k: String) = args.int(k) ?: throw InvalidArgsException("missing $k")
                 val before = read(call, d).frame
-                svc().swipe(i("x1").toFloat(), i("y1").toFloat(), i("x2").toFloat(), i("y2").toFloat(), (args.int("durationMs") ?: 300).toLong().coerceIn(50, 5000), d)
-                return after(call, t, before, "Swiped")
+                val acted = svc().swipe(i("x1").toFloat(), i("y1").toFloat(), i("x2").toFloat(), i("y2").toFloat(), (args.int("durationMs") ?: 300).toLong().coerceIn(50, 5000), d)
+                val result = after(call, t, before, if (acted) "Swiped" else "Swipe was cancelled")
+                return if (acted) result else result.failed("gesture_cancelled", "Android cancelled the swipe.")
             }
         },
         object : ScreenTool("screen_scroll", Risk.write, true, "Scroll the screen or a scrollable element.", {
@@ -497,9 +602,11 @@ class ScreenTools @Inject constructor(
             override suspend fun run(args: JsonObject, call: CallContext, t: ScreenTarget): ToolResult {
                 val d = t.displayId
                 val dir = args.reqStr("direction")
+                if (dir !in listOf("down", "up", "left", "right")) throw InvalidArgsException("Unknown scroll direction")
                 val r = read(call, d)
                 val n = locate(call, d, args.only("node"), r)?.node
-                if (n != null && n.isScrollable) {
+                if (n != null && !n.isScrollable) throw InvalidArgsException("Target is not scrollable")
+                val acted = if (n != null) {
                     n.performAction(if (dir == "down" || dir == "right") AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
                 } else {
                     val m = metrics(d)
@@ -512,7 +619,8 @@ class ScreenTools @Inject constructor(
                         else -> svc().swipe(cx - dx, cy, cx + dx, cy, 350, d)
                     }
                 }
-                return after(call, t, r.frame, "Scrolled $dir")
+                val result = after(call, t, r.frame, if (acted) "Scrolled $dir" else "Scroll did not move (end reached or Android refused it)")
+                return if (acted) result else result.withOutcome(ActionOutcome.NoEffect)
             }
         },
         object : ScreenTool("screen_key", Risk.write, true,
@@ -523,6 +631,7 @@ class ScreenTools @Inject constructor(
         }) {
             override suspend fun run(args: JsonObject, call: CallContext, t: ScreenTarget): ToolResult {
                 val key = args.reqStr("key")
+                if (key !in listOf("enter", "search", "delete", "back", "home", "recents", "notifications", "quick_settings", "lock_screen")) throw InvalidArgsException("Unknown key")
                 val d = t.displayId
                 val r = read(call, d)
                 val watch = if (t.agent) agent.watch(call.sessionId) else null
@@ -570,9 +679,12 @@ class ScreenTools @Inject constructor(
                     val ok = (pkg == null || snap.packageName == pkg) && (if (gone && text != null) !hasText else hasText)
                     if (ok || SystemClock.elapsedRealtime() > until) {
                         val r = Read(snap, view(call, t.displayId).ids.assign(snap.packageName, snap.elements))
-                        return ToolResult.text("${if (ok) "Condition met" else "Timed out waiting"} — ${full(call, t, r, 6000, forceOcr = false)}")
+                        val result = ToolResult.text("${if (ok) "Condition met" else "Timed out waiting"} — ${full(call, t, r, 6000, forceOcr = false)}")
                             .withOutcome(null, r.frame.fingerprint)
+                            .withObservation(observation(call, t, r))
+                        return if (ok) result else result.failed("condition_timeout", "The wait condition did not hold before the timeout.")
                     }
+                    call.checkCurrent()
                     delay(500)
                 }
             }
